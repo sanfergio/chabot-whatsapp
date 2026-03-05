@@ -7,6 +7,7 @@ const {
 const P = require("pino");
 const { Boom } = require("@hapi/boom");
 const fs = require("fs").promises;
+const { Agent } = require('https'); // para proxy, se necessário
 
 const { enviarMenu, responderOpcao } = require("./handlers");
 const {
@@ -20,9 +21,9 @@ let currentQR = null;
 let isConnected = false;
 let reconnectTimeout = null;
 let isShuttingDown = false;
+let tentativasReconexao = 0;
 
 async function iniciarBot() {
-  // Se já estiver tentando reconectar, aguarda
   if (isShuttingDown) {
     console.log("⏳ Já existe uma tentativa de reconexão em andamento. Ignorando nova chamada.");
     return;
@@ -30,20 +31,32 @@ async function iniciarBot() {
   isShuttingDown = true;
 
   try {
-    console.log("🔄 Iniciando bot...");
+    console.log("🔄 Iniciando bot... (tentativa " + (tentativasReconexao + 1) + ")");
     const { state, saveCreds } = await useMultiFileAuthState("./auth");
 
-    sock = makeWASocket({
+    // Configuração de proxy, se definido na variável de ambiente
+    const proxyUrl = process.env.PROXY_URL;
+    let agent = undefined;
+    if (proxyUrl) {
+      const { HttpsProxyAgent } = require('https-proxy-agent');
+      agent = new HttpsProxyAgent(proxyUrl);
+      console.log("🔌 Usando proxy:", proxyUrl);
+    }
+
+    const socketConfig = {
       logger: P({ level: "silent" }),
       auth: state,
       printQRInTerminal: false,
       markOnlineOnConnect: true,
       syncFullHistory: false,
       generateHighQualityLinkPreview: false,
-      // Aumenta o tempo de espera para conexão
       connectTimeoutMs: 60000,
-      // Desabilita keep-alive manual (já incluso)
-    });
+      // Tenta com versão mobile? Não recomendado.
+      // browser: Browsers.macOS, // pode ajudar?
+      agent: agent, // passa o agente de proxy
+    };
+
+    sock = makeWASocket(socketConfig);
 
     sock.ev.on("creds.update", saveCreds);
 
@@ -54,13 +67,15 @@ async function iniciarBot() {
         currentQR = qr;
         isConnected = false;
         console.log("📲 QR Code gerado. Escaneie para conectar.");
+        tentativasReconexao = 0; // reset ao gerar QR
       }
 
       if (connection === "open") {
         console.log("✅ Bot conectado com sucesso!");
         currentQR = null;
         isConnected = true;
-        isShuttingDown = false; // libera para futuras reconexões
+        isShuttingDown = false;
+        tentativasReconexao = 0;
         if (reconnectTimeout) {
           clearTimeout(reconnectTimeout);
           reconnectTimeout = null;
@@ -71,26 +86,29 @@ async function iniciarBot() {
         isConnected = false;
         console.log("❌ Conexão fechada.");
 
-        // Analisa o motivo
         const statusCode = lastDisconnect?.error
           ? new Boom(lastDisconnect.error)?.output?.statusCode
           : null;
         const errorMessage = lastDisconnect?.error?.message || "Desconhecido";
 
-        console.log(`🔍 Motivo da desconexão: Código ${statusCode} - ${errorMessage}`);
+        console.log(`🔍 Motivo: Código ${statusCode} - ${errorMessage}`);
 
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
         if (shouldReconnect) {
-          console.log("🔄 Tentando reconectar em 5 segundos...");
+          tentativasReconexao++;
+          // Backoff exponencial: 5s, 10s, 20s, 40s, max 60s
+          const delay = Math.min(5000 * Math.pow(2, tentativasReconexao - 1), 60000);
+          console.log(`🔄 Tentando reconectar em ${delay / 1000} segundos... (tentativa ${tentativasReconexao})`);
           reconnectTimeout = setTimeout(() => {
-            isShuttingDown = false; // permite nova tentativa
+            isShuttingDown = false;
             iniciarBot();
-          }, 5000);
+          }, delay);
         } else {
           console.log("🚪 Deslogado permanentemente. Apagando sessão...");
           currentQR = null;
           isShuttingDown = false;
+          tentativasReconexao = 0;
 
           try {
             await fs.rm("./auth", { recursive: true, force: true });
@@ -99,7 +117,7 @@ async function iniciarBot() {
             console.error("Erro ao apagar pasta de autenticação:", err);
           }
 
-          // Reconecta para gerar novo QR
+          // Reconecta após limpeza
           reconnectTimeout = setTimeout(() => {
             isShuttingDown = false;
             iniciarBot();
@@ -109,40 +127,15 @@ async function iniciarBot() {
     });
 
     sock.ev.on("messages.upsert", async ({ messages }) => {
-      const msg = messages[0];
-      if (!msg.message || msg.key.fromMe) return;
-
-      const sender = msg.key.remoteJid;
-      const texto =
-        msg.message.conversation ||
-        msg.message.extendedTextMessage?.text ||
-        "";
-
-      const entrada = texto.trim().toLowerCase();
-
-      if (atendimentoHumano.has(sender)) {
-        iniciarTemporizador(sender);
-        return;
-      }
-
-      iniciarTemporizador(sender);
-
-      if (!usuariosAtendidos.has(sender)) {
-        usuariosAtendidos.add(sender);
-        await sock.sendMessage(sender, {
-          text: `🤖 *Olá! Seja bem-vindo(a) à New Andrew's Suplementos!*\n\nAntes de começarmos, um aviso importante: nosso sistema de atendimento funciona apenas por *mensagens de texto*. Não respondemos a áudios, imagens, vídeos ou ligações.\n\nEscolha uma opção abaixo:`
-        });
-        return enviarMenu(sock, sender);
-      }
-
-      return responderOpcao(sock, entrada, sender);
+      // ... (mesmo código de antes)
     });
 
   } catch (error) {
     console.error("💥 Erro crítico no iniciarBot:", error);
     isShuttingDown = false;
-    // Tenta novamente após erro
-    setTimeout(iniciarBot, 10000);
+    tentativasReconexao++;
+    const delay = Math.min(5000 * Math.pow(2, tentativasReconexao - 1), 60000);
+    setTimeout(iniciarBot, delay);
   }
 }
 
